@@ -6,77 +6,64 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from Bio import SeqIO
-from scipy.cluster.hierarchy import cophenet, dendrogram, fcluster, linkage
-from scipy.spatial.distance import pdist, squareform
+from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
+from scipy.spatial.distance import pdist
 
-# ---------- Page setup ----------
-st.set_page_config(page_title="DNA Clustering", page_icon="🧬", layout="wide")
+st.set_page_config(page_title="DNA Clustering", page_icon="🧬")
 st.title("🧬 DNA Sequence Clustering")
-st.caption("Upload DNA sequences, pick a distance and linkage method, and explore the clusters.")
+st.write("Upload a FASTA file, or a CSV with columns `gene` and `sequence`.")
 
+file = st.file_uploader("Upload your file", type=["fasta", "fa", "csv"])
+k = st.slider("Number of clusters", 2, 8, 3)
+if file is None:
+    st.info("Upload a file to see the results.")
+    st.stop()
 
-# ---------- Helper functions ----------
-def example_data():
-    """12 made-up genes in 3 groups with different GC content."""
-    rng = np.random.default_rng(1)
-    groups = [[0.35, 0.35, 0.15, 0.15], [0.25, 0.25, 0.25, 0.25], [0.15, 0.15, 0.35, 0.35]]
-    names, seqs = [], []
-    for g, probs in enumerate(groups):
-        for i in range(4):
-            length = int(rng.integers(80, 150))
-            names.append(f"Gene_{g + 1}{chr(65 + i)}")
-            seqs.append("".join(rng.choice(list("ATGC"), size=length, p=probs)))
-    return names, seqs
+# 1. Read the file
+text = file.getvalue().decode("utf-8-sig")
+if file.name.lower().endswith(".csv"):
+    data = pd.read_csv(io.StringIO(text))
+    data.columns = [c.strip().lower() for c in data.columns]
+    if "sequence" not in data.columns:
+        st.error("The CSV needs a column called 'sequence'.")
+        st.stop()
+    seqs = data["sequence"].astype(str).tolist()
+    names = data["gene"].astype(str).tolist() if "gene" in data.columns else [f"Seq{i + 1}" for i in range(len(seqs))]
+else:
+    records = list(SeqIO.parse(io.StringIO(text), "fasta"))
+    names = [r.id for r in records]
+    seqs = [str(r.seq) for r in records]
 
+# 2. Keep only valid sequences (A, T, G, C)
+pairs = [(n, re.sub(r"\s+", "", s.upper())) for n, s in zip(names, seqs)]
+pairs = [(n, s) for n, s in pairs if s and set(s) <= set("ATGC")]
+st.write(f"Read {len(seqs)} sequences, {len(pairs)} are valid.")
+if len(pairs) < 3:
+    st.warning("You need at least 3 valid sequences.")
+    st.stop()
+names = [n for n, s in pairs]
+seqs = [s for n, s in pairs]
 
-def read_file(uploaded):
-    """Read a FASTA, CSV or TSV file into (names, sequences)."""
-    text = uploaded.getvalue().decode("utf-8-sig")
-    filename = uploaded.name.lower()
-    if filename.endswith((".csv", ".tsv")):
-        sep = "," if filename.endswith(".csv") else "\t"
-        df = pd.read_csv(io.StringIO(text), sep=sep)
-        cols = {c.strip().lower(): c for c in df.columns}
-        seq_col = next((cols[c] for c in ["sequence", "dna_sequence", "seq"] if c in cols), None)
-        name_col = next((cols[c] for c in ["gene", "gene_id", "name", "id"] if c in cols), None)
-        if seq_col is None:
-            st.error("Could not find a sequence column (use: sequence, dna_sequence or seq).")
-            st.stop()
-        seqs = df[seq_col].astype(str).tolist()
-        names = df[name_col].astype(str).tolist() if name_col else [f"Sequence_{i + 1}" for i in range(len(df))]
-    else:
-        records = list(SeqIO.parse(io.StringIO(text), "fasta"))
-        names = [r.id for r in records]
-        seqs = [str(r.seq) for r in records]
-    return names, seqs
+# 3. Base frequencies, then cluster
+features = np.array([[s.count(b) / len(s) for b in "ATGC"] for s in seqs])
+Z = linkage(pdist(features), method="average")
+clusters = fcluster(Z, t=min(k, len(seqs)), criterion="maxclust")
 
+# 4. Show results
+results = pd.DataFrame({
+    "Gene": names,
+    "Length": [len(s) for s in seqs],
+    "GC_content": [round((s.count("G") + s.count("C")) / len(s), 3) for s in seqs],
+    "Cluster": clusters,
+})
+st.subheader("Results")
+st.dataframe(results, use_container_width=True)
 
-def clean(names, seqs):
-    """Keep only sequences made of A, T, G, C."""
-    good_names, good_seqs = [], []
-    for n, s in zip(names, seqs):
-        s = re.sub(r"\s+", "", s.upper())
-        if s and set(s) <= set("ATGC"):
-            good_names.append(n)
-            good_seqs.append(s)
-    return good_names, good_seqs
+st.subheader("Dendrogram")
+fig, ax = plt.subplots(figsize=(10, 4))
+dendrogram(Z, labels=names, leaf_rotation=90, ax=ax)
+st.pyplot(fig)
 
-
-def base_frequencies(seq):
-    return [seq.count(b) / len(seq) for b in "ATGC"]
-
-
-# ---------- Sidebar ----------
-st.sidebar.header("⚙️ Settings")
-uploaded = st.sidebar.file_uploader("Upload sequences", type=["fasta", "fa", "fna", "csv", "tsv"])
-use_example = st.sidebar.checkbox("Use example data", value=uploaded is None)
-metric_label = st.sidebar.selectbox("Distance metric", ["Euclidean", "Manhattan"])
-metric = "euclidean" if metric_label == "Euclidean" else "cityblock"
-methods = ["single", "complete", "average"] + (["ward"] if metric == "euclidean" else [])
-method = st.sidebar.selectbox("Linkage method", methods, index=2)
-k = st.sidebar.slider("Number of clusters", 2, 8, 3)
-max_seqs = st.sidebar.slider("Max sequences to analyse", 10, 500, 200)
-
-# ---------- Load and clean ----------
-if uploaded is not None and not use_example:
-    names, seqs =
+st.subheader("Genes per cluster")
+st.bar_chart(results["Cluster"].value_counts().sort_index())
+st.download_button("Download results (CSV)", results.to_csv(index=False), "clusters.csv", "text/csv")
